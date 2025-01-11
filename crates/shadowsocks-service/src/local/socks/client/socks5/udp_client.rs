@@ -47,7 +47,7 @@ impl Socks5UdpClient {
         match proxy_addr {
             Address::SocketAddress(sa) => self.socket.connect(sa).await?,
             // FIXME: `connect` will use tokio's builtin DNS resolver.
-            // But if we want to use `trust-dns`, we have to initialize a `Context` instance (for the global `AsyncResolver` instance)
+            // But if we want to use `hickory-dns`, we have to initialize a `Context` instance (for the global `AsyncResolver` instance)
             Address::DomainNameAddress(ref dname, port) => self.socket.connect((dname.as_str(), port)).await?,
         }
 
@@ -70,7 +70,7 @@ impl Socks5UdpClient {
         send_buf.put_slice(buf);
 
         let n = self.socket.send(&send_buf).await?;
-        Ok(if n <= header_len { 0 } else { n - header_len })
+        Ok(n.saturating_sub(header_len))
     }
 
     /// Returns a future that receives a single datagram on the socket. On success, the future resolves to the number of bytes read and the origin.

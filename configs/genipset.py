@@ -41,7 +41,7 @@ def generate_ipset(content, name, location_set, type_set, output_file):
                     '''
                     In the case of IPv4 address the count of hosts for this range. This count does not have to represent a CIDR range.
 
-                    But. It seems that it is always a CIDR range in this paticalur file.
+                    But. It seems that it is always a CIDR range in this particular file.
                     '''
                     mask = cidr_trans[int(value)]
                     output_file.write(
@@ -77,8 +77,8 @@ if __name__ == '__main__':
     start_time = time.time()
     data = get_apnic_delegated()
 
-    if hasattr(parser, 'output'):
-        with open(parser.output, 'w') as fp:
+    if hasattr(args, 'output'):
+        with open(args.output, 'w') as fp:
             generate_ipset(data, name, location_set, type_set, fp)
     else:
         generate_ipset(data, name, location_set, type_set, sys.stdout)

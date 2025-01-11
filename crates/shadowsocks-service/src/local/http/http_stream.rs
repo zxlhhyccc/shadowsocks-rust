@@ -6,7 +6,6 @@ use std::{
     task::{self, Poll},
 };
 
-use hyper::client::connect::{Connected, Connection};
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -34,26 +33,26 @@ impl ProxyHttpStream {
         let cx = match TlsConnector::builder().request_alpns(&["h2", "http/1.1"]).build() {
             Ok(c) => c,
             Err(err) => {
-                return Err(io::Error::new(ErrorKind::Other, format!("tls build: {}", err)));
+                return Err(io::Error::new(ErrorKind::Other, format!("tls build: {err}")));
             }
         };
         let cx = tokio_native_tls::TlsConnector::from(cx);
 
         match cx.connect(domain, stream).await {
             Ok(s) => {
-                let negociated_h2 = match s.get_ref().negotiated_alpn() {
+                let negotiated_h2 = match s.get_ref().negotiated_alpn() {
                     Ok(Some(alpn)) => alpn == b"h2",
                     Ok(None) => false,
                     Err(err) => {
-                        let ierr = io::Error::new(ErrorKind::Other, format!("tls alpn negociate: {}", err));
+                        let ierr = io::Error::new(ErrorKind::Other, format!("tls alpn negotiate: {err}"));
                         return Err(ierr);
                     }
                 };
 
-                Ok(ProxyHttpStream::Https(s, negociated_h2))
+                Ok(ProxyHttpStream::Https(s, negotiated_h2))
             }
             Err(err) => {
-                let ierr = io::Error::new(ErrorKind::Other, format!("tls connect: {}", err));
+                let ierr = io::Error::new(ErrorKind::Other, format!("tls connect: {err}"));
                 Err(ierr)
             }
         }
@@ -63,52 +62,60 @@ impl ProxyHttpStream {
     pub async fn connect_https(stream: AutoProxyClientStream, domain: &str) -> io::Result<ProxyHttpStream> {
         use log::warn;
         use once_cell::sync::Lazy;
+        use rustls_native_certs::CertificateResult;
         use std::sync::Arc;
         use tokio_rustls::{
-            rustls::{ClientConfig, Session},
-            webpki::DNSNameRef,
+            rustls::{pki_types::ServerName, ClientConfig, RootCertStore},
             TlsConnector,
         };
 
         static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
-            let mut config = ClientConfig::new();
+            let mut config = ClientConfig::builder()
+                .with_root_certificates({
+                    // Load WebPKI roots (Mozilla's root certificates)
+                    let mut store = RootCertStore::empty();
+                    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-            match rustls_native_certs::load_native_certs() {
-                Ok(store) => {
-                    config.root_store = store;
-                }
-                Err((_, err)) => {
-                    warn!("failed to load native certs, {}", err);
+                    let CertificateResult { certs, errors, .. } = rustls_native_certs::load_native_certs();
+                    if !errors.is_empty() {
+                        for error in errors {
+                            warn!("failed to load cert (native), error: {}", error);
+                        }
+                    }
 
-                    config
-                        .root_store
-                        .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-                }
-            }
+                    for cert in certs {
+                        if let Err(err) = store.add(cert) {
+                            warn!("failed to add cert (native), error: {}", err);
+                        }
+                    }
 
-            // Try to negociate HTTP/2
+                    store
+                })
+                .with_no_client_auth();
+
+            // Try to negotiate HTTP/2
             config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             Arc::new(config)
         });
 
         let connector = TlsConnector::from(TLS_CONFIG.clone());
 
-        let host = match DNSNameRef::try_from_ascii_str(domain) {
+        let host = match ServerName::try_from(domain) {
             Ok(n) => n,
             Err(_) => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidInput,
-                    format!("invalid dnsname \"{}\"", domain),
+                    format!("invalid dnsname \"{domain}\""),
                 ));
             }
         };
 
-        let tls_stream = connector.connect(host, stream).await?;
+        let tls_stream = connector.connect(host.to_owned(), stream).await?;
 
         let (_, session) = tls_stream.get_ref();
-        let negociated_http2 = matches!(session.get_alpn_protocol(), Some(b"h2"));
+        let negotiated_http2 = matches!(session.alpn_protocol(), Some(b"h2"));
 
-        Ok(ProxyHttpStream::Https(tls_stream, negociated_http2))
+        Ok(ProxyHttpStream::Https(tls_stream, negotiated_http2))
     }
 
     #[cfg(not(any(feature = "local-http-native-tls", feature = "local-http-rustls")))]
@@ -120,7 +127,7 @@ impl ProxyHttpStream {
         Err(err)
     }
 
-    pub fn negociated_http2(&self) -> bool {
+    pub fn negotiated_http2(&self) -> bool {
         match *self {
             ProxyHttpStream::Http(..) => false,
             #[cfg(any(feature = "local-http-native-tls", feature = "local-http-rustls"))]
@@ -156,16 +163,5 @@ impl AsyncWrite for ProxyHttpStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
         forward_call!(self, poll_shutdown, cx)
-    }
-}
-
-impl Connection for ProxyHttpStream {
-    fn connected(&self) -> Connected {
-        let conn = Connected::new();
-        if self.negociated_http2() {
-            conn.negotiated_h2()
-        } else {
-            conn
-        }
     }
 }

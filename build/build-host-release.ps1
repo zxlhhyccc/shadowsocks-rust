@@ -34,19 +34,24 @@ $Version = $Version -replace '"'
 $PackageReleasePath = "${PSScriptRoot}\release"
 $PackageName = "shadowsocks-v${Version}.${TargetTriple}.zip"
 $PackagePath = "${PackageReleasePath}\${PackageName}"
+$ReleaseBuildPath = "${PSScriptRoot}\..\target\release"
 
 Write-Host $Version
 Write-Host $PackageReleasePath
 Write-Host $PackageName
 Write-Host $PackagePath
+Write-Host $ReleaseBuildPath
 
-Push-Location "${PSScriptRoot}\..\target\release"
+Push-Location $ReleaseBuildPath
 
 $ProgressPreference = "SilentlyContinue"
 New-Item "${PackageReleasePath}" -ItemType Directory -ErrorAction SilentlyContinue
 $CompressParam = @{
-    LiteralPath     = "sslocal.exe", "ssserver.exe", "ssurl.exe", "ssmanager.exe"
+    LiteralPath     = "sslocal.exe", "ssserver.exe", "ssurl.exe", "ssmanager.exe", "ssservice.exe"
     DestinationPath = "${PackagePath}"
+}
+if ([System.IO.File]::Exists("$ReleaseBuildPath\sswinservice.exe")) {
+    $CompressParam.LiteralPath += "sswinservice.exe"
 }
 Compress-Archive @CompressParam
 
@@ -57,3 +62,5 @@ $PackageHash = (Get-FileHash -Path "${PackagePath}" -Algorithm SHA256).Hash
 "${PackageHash}  ${PackageName}" | Out-File -FilePath "${PackageChecksumPath}"
 
 Write-Host "Created release packet checksum ${PackageChecksumPath}"
+
+Pop-Location

@@ -16,6 +16,13 @@ pub trait ManagerProtocol: Sized {
     fn to_bytes(&self) -> Result<Vec<u8>, Error>;
 }
 
+/// Server's user configuration
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ServerUserConfig {
+    pub name: String,
+    pub password: String,
+}
+
 /// Server's configuration
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ServerConfig {
@@ -30,7 +37,11 @@ pub struct ServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_opts: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub users: Option<Vec<ServerUserConfig>>,
 }
 
 /// `add` request
@@ -186,7 +197,7 @@ impl ManagerProtocol for PingRequest {
     }
 }
 
-/// `ping` reponse
+/// `ping` response
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(transparent)]
 pub struct PingResponse {

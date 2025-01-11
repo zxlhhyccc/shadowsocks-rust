@@ -1,10 +1,6 @@
 //! Shadowsocks Local Utilities
 
-use std::{
-    io,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
-};
+use std::{io, net::SocketAddr, time::Duration};
 
 use log::{debug, trace};
 use shadowsocks::{
@@ -34,11 +30,10 @@ where
             "established tcp tunnel {} <-> {} through sever {} (outbound: {})",
             peer_addr,
             target_addr,
-            svr_cfg.external_addr(),
+            svr_cfg.tcp_external_addr(),
             svr_cfg.addr(),
         );
     } else {
-        debug!("established tcp tunnel {} <-> {} bypassed", peer_addr, target_addr);
         return establish_tcp_tunnel_bypassed(plain, shadow, peer_addr, target_addr).await;
     }
 
@@ -61,7 +56,7 @@ where
             Ok(Err(err)) => return Err(err),
             Err(..) => {
                 // Timeout. Send handshake to server.
-                shadow.write(&[]).await?;
+                let _ = shadow.write(&[]).await?;
 
                 trace!(
                     "tcp tunnel {} -> {} (proxied) sent handshake without data",
@@ -95,7 +90,7 @@ where
     Ok(())
 }
 
-async fn establish_tcp_tunnel_bypassed<P, S>(
+pub(crate) async fn establish_tcp_tunnel_bypassed<P, S>(
     plain: &mut P,
     shadow: &mut S,
     peer_addr: SocketAddr,
@@ -105,6 +100,8 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    debug!("established tcp tunnel {} <-> {} bypassed", peer_addr, target_addr);
+
     match copy_bidirectional(plain, shadow).await {
         Ok((rn, wn)) => {
             trace!(
@@ -126,15 +123,4 @@ where
     }
 
     Ok(())
-}
-
-/// Helper function for converting IPv4 mapped IPv6 address
-///
-/// This is the same as `Ipv6Addr::to_ipv4_mapped`, but it is still unstable in the current libstd
-#[allow(unused)]
-pub(crate) fn to_ipv4_mapped(ipv6: &Ipv6Addr) -> Option<Ipv4Addr> {
-    match ipv6.octets() {
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, a, b, c, d] => Some(Ipv4Addr::new(a, b, c, d)),
-        _ => None,
-    }
 }

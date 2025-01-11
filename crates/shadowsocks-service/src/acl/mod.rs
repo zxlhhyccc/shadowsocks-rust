@@ -9,12 +9,15 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, Error, ErrorKind},
     net::{IpAddr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
+    str,
 };
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
-use regex::bytes::{RegexSet, RegexSetBuilder};
+use log::{trace, warn};
+use once_cell::sync::Lazy;
+use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 
 use shadowsocks::{context::Context, relay::socks5::Address};
 
@@ -114,8 +117,25 @@ impl Rules {
     /// Check if the specified address matches any rules
     fn check_ip_matched(&self, addr: &IpAddr) -> bool {
         match addr {
-            IpAddr::V4(v4) => self.ipv4.contains(v4),
-            IpAddr::V6(v6) => self.ipv6.contains(v6),
+            IpAddr::V4(v4) => {
+                if self.ipv4.contains(v4) {
+                    return true;
+                }
+
+                let mapped_ipv6 = v4.to_ipv6_mapped();
+                self.ipv6.contains(&mapped_ipv6)
+            }
+            IpAddr::V6(v6) => {
+                if self.ipv6.contains(v6) {
+                    return true;
+                }
+
+                if let Some(mapped_ipv4) = v6.to_ipv4_mapped() {
+                    return self.ipv4.contains(&mapped_ipv4);
+                }
+
+                false
+            }
         }
     }
 
@@ -158,25 +178,74 @@ impl ParsingRules {
     }
 
     fn add_ipv4_rule(&mut self, rule: impl Into<Ipv4Net>) {
-        self.ipv4.add(rule.into());
+        let rule = rule.into();
+        trace!("IPV4-RULE {}", rule);
+        self.ipv4.add(rule);
     }
 
     fn add_ipv6_rule(&mut self, rule: impl Into<Ipv6Net>) {
-        self.ipv6.add(rule.into());
+        let rule = rule.into();
+        trace!("IPV6-RULE {}", rule);
+        self.ipv6.add(rule);
     }
 
     fn add_regex_rule(&mut self, mut rule: String) {
+        static TREE_SET_RULE_EQUIV: Lazy<Regex> = Lazy::new(|| {
+            RegexBuilder::new(
+                r#"^(?:(?:\((?:\?:)?\^\|\\\.\)|(?:\^\.(?:\+|\*))?\\\.)((?:[\w-]+(?:\\\.)?)+)|\^((?:[\w-]+(?:\\\.)?)+))\$?$"#,
+            )
+            .unicode(false)
+            .build()
+            .unwrap()
+        });
+
+        if let Some(caps) = TREE_SET_RULE_EQUIV.captures(rule.as_bytes()) {
+            if let Some(tree_rule) = caps.get(1) {
+                if let Ok(tree_rule) = str::from_utf8(tree_rule.as_bytes()) {
+                    let tree_rule = tree_rule.replace("\\.", ".");
+                    if self.add_tree_rule_inner(&tree_rule).is_ok() {
+                        trace!("REGEX-RULE {} => TREE-RULE {}", rule, tree_rule);
+                        return;
+                    }
+                }
+            } else if let Some(set_rule) = caps.get(2) {
+                if let Ok(set_rule) = str::from_utf8(set_rule.as_bytes()) {
+                    let set_rule = set_rule.replace("\\.", ".");
+                    if self.add_set_rule_inner(&set_rule).is_ok() {
+                        trace!("REGEX-RULE {} => SET-RULE {}", rule, set_rule);
+                        return;
+                    }
+                }
+            }
+        }
+
+        trace!("REGEX-RULE {}", rule);
+
         rule.make_ascii_lowercase();
+
+        // Handle it as a normal REGEX
         // FIXME: If this line is not a valid regex, how can we know without actually compile it?
         self.rules_regex.push(rule);
     }
 
+    #[inline]
     fn add_set_rule(&mut self, rule: &str) -> io::Result<()> {
+        trace!("SET-RULE {}", rule);
+        self.add_set_rule_inner(rule)
+    }
+
+    fn add_set_rule_inner(&mut self, rule: &str) -> io::Result<()> {
         self.rules_set.insert(self.check_is_ascii(rule)?.to_ascii_lowercase());
         Ok(())
     }
 
+    #[inline]
     fn add_tree_rule(&mut self, rule: &str) -> io::Result<()> {
+        trace!("TREE-RULE {}", rule);
+        self.add_tree_rule_inner(rule)
+    }
+
+    fn add_tree_rule_inner(&mut self, rule: &str) -> io::Result<()> {
         // SubDomainsTree do lowercase conversion inside insert
         self.rules_tree.insert(self.check_is_ascii(rule)?);
         Ok(())
@@ -195,12 +264,12 @@ impl ParsingRules {
     }
 
     fn compile_regex(name: &'static str, regex_rules: Vec<String>) -> io::Result<RegexSet> {
-        const REGEX_SIZE_LIMIT: usize = usize::max_value();
+        const REGEX_SIZE_LIMIT: usize = usize::MAX;
         RegexSetBuilder::new(regex_rules)
             .size_limit(REGEX_SIZE_LIMIT)
             .unicode(false)
             .build()
-            .map_err(|err| Error::new(ErrorKind::Other, format!("{} regex error: {}", name, err)))
+            .map_err(|err| Error::new(ErrorKind::Other, format!("{name} regex error: {err}")))
     }
 
     fn into_rules(self) -> io::Result<Rules> {
@@ -252,7 +321,7 @@ impl ParsingRules {
 /// Mode is the default ACL strategy for those addresses that are not in configuration file.
 ///
 /// - `BlackList` - Bypasses / Rejects all addresses except those in `[proxy_list]` or `[white_list]`
-/// - `WhiltList` - Proxies / Accepts all addresses except those in `[bypass_list]` or `[black_list]`
+/// - `WhiteList` - Proxies / Accepts all addresses except those in `[bypass_list]` or `[black_list]`
 ///
 /// ## Rules
 ///
@@ -269,12 +338,18 @@ pub struct AccessControl {
     black_list: Rules,
     white_list: Rules,
     mode: Mode,
+    file_path: PathBuf,
 }
 
 impl AccessControl {
     /// Load ACL rules from a file
     pub fn load_from_file<P: AsRef<Path>>(p: P) -> io::Result<AccessControl> {
-        let fp = File::open(p)?;
+        trace!("ACL loading from {:?}", p.as_ref());
+
+        let file_path_ref = p.as_ref();
+        let file_path = file_path_ref.to_path_buf();
+
+        let fp = File::open(file_path_ref)?;
         let r = BufReader::new(fp);
 
         let mut mode = Mode::BlackList;
@@ -283,6 +358,8 @@ impl AccessControl {
         let mut bypass = ParsingRules::new("[black_list] or [bypass_list]");
         let mut proxy = ParsingRules::new("[white_list] or [proxy_list]");
         let mut curr = &mut bypass;
+
+        trace!("ACL parsing start from mode {:?} and black_list / bypass_list", mode);
 
         for line in r.lines() {
             let line = line?;
@@ -297,6 +374,11 @@ impl AccessControl {
 
             let line = line.trim();
 
+            if !line.is_ascii() {
+                warn!("ACL rule {} containing non-ASCII characters, skipped", line);
+                continue;
+            }
+
             if let Some(rule) = line.strip_prefix("||") {
                 curr.add_tree_rule(rule)?;
                 continue;
@@ -310,18 +392,23 @@ impl AccessControl {
             match line {
                 "[reject_all]" | "[bypass_all]" => {
                     mode = Mode::WhiteList;
+                    trace!("switch to mode {:?}", mode);
                 }
                 "[accept_all]" | "[proxy_all]" => {
                     mode = Mode::BlackList;
+                    trace!("switch to mode {:?}", mode);
                 }
                 "[outbound_block_list]" => {
                     curr = &mut outbound_block;
+                    trace!("loading outbound_block_list");
                 }
                 "[black_list]" | "[bypass_list]" => {
                     curr = &mut bypass;
+                    trace!("loading black_list / bypass_list");
                 }
                 "[white_list]" | "[proxy_list]" => {
                     curr = &mut proxy;
+                    trace!("loading white_list / proxy_list");
                 }
                 _ => {
                     match line.parse::<IpNet>() {
@@ -355,7 +442,13 @@ impl AccessControl {
             black_list: bypass.into_rules()?,
             white_list: proxy.into_rules()?,
             mode,
+            file_path,
         })
+    }
+
+    /// Get ACL file path
+    pub fn file_path(&self) -> &Path {
+        &self.file_path
     }
 
     /// Check if domain name is in proxy_list.
@@ -412,7 +505,7 @@ impl AccessControl {
 
     /// Default mode
     ///
-    /// Default behavor for hosts that are not configured
+    /// Default behavior for hosts that are not configured
     /// - `true` - Proxied
     /// - `false` - Bypassed
     pub fn is_default_in_proxy_list(&self) -> bool {

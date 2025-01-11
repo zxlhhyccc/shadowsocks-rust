@@ -7,16 +7,15 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use lru_time_cache::LruCache;
 use shadowsocks::{
     lookup_then,
-    net::ConnectOpts,
+    net::{get_ip_stack_capabilities, ConnectOpts},
     relay::{socks5::Address, udprelay::MAXIMUM_UDP_PAYLOAD_SIZE},
     ServerAddr,
 };
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{sync::Mutex, task::JoinHandle, time};
 
 use crate::{
     config::RedirType,
@@ -25,8 +24,8 @@ use crate::{
         loadbalancing::PingBalancer,
         net::{UdpAssociationManager, UdpInboundWrite},
         redir::redir_ext::{RedirSocketOpts, UdpSocketRedirExt},
-        utils::to_ipv4_mapped,
     },
+    net::utils::to_ipv4_mapped,
 };
 
 use self::sys::UdpRedirSocket;
@@ -91,18 +90,36 @@ impl UdpRedirInboundWriter {
     }
 }
 
-#[async_trait]
 impl UdpInboundWrite for UdpRedirInboundWriter {
-    async fn send_to(&self, peer_addr: SocketAddr, remote_addr: &Address, data: &[u8]) -> io::Result<()> {
+    async fn send_to(&self, mut peer_addr: SocketAddr, remote_addr: &Address, data: &[u8]) -> io::Result<()> {
+        // If IPv6 Transparent Proxy is supported on the current platform,
+        // then we should always use IPv6 sockets for sending IPv4 packets.
+        let ip_stack_caps = get_ip_stack_capabilities();
+
         let addr = match *remote_addr {
             Address::SocketAddress(sa) => {
-                // Try to convert IPv4 mapped IPv6 address if server is running on dual-stack mode
                 match sa {
-                    SocketAddr::V4(..) => sa,
-                    SocketAddr::V6(ref v6) => match to_ipv4_mapped(v6.ip()) {
-                        Some(v4) => SocketAddr::new(IpAddr::from(v4), v6.port()),
-                        None => sa,
-                    },
+                    SocketAddr::V4(ref v4) => {
+                        // If IPv4-mapped-IPv6 is supported.
+                        // Converts IPv4 address to IPv4-mapped-IPv6
+                        // All sockets will be created in IPv6 (nearly all modern OS supports IPv6 sockets)
+                        if ip_stack_caps.support_ipv4_mapped_ipv6 {
+                            SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port())
+                        } else {
+                            sa
+                        }
+                    }
+                    SocketAddr::V6(ref v6) => {
+                        // If IPv6 is not supported. Try to map it back to IPv4.
+                        if !ip_stack_caps.support_ipv6 || !ip_stack_caps.support_ipv4_mapped_ipv6 {
+                            match v6.ip().to_ipv4_mapped() {
+                                Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+                                None => sa,
+                            }
+                        } else {
+                            sa
+                        }
+                    }
                 }
             }
             Address::DomainNameAddress(..) => {
@@ -134,124 +151,170 @@ impl UdpInboundWrite for UdpRedirInboundWriter {
             }
         };
 
-        // Send back to client
-        inbound.send_to(data, peer_addr).await.map(|n| {
-            if n < data.len() {
-                warn!(
-                    "udp redir send back data (actual: {} bytes, sent: {} bytes), remote: {}, peer: {}",
-                    n,
-                    data.len(),
-                    remote_addr,
-                    peer_addr
-                );
+        // Convert peer_addr (client)'s address family to match remote_addr (target)
+        match (addr, peer_addr) {
+            (SocketAddr::V4(..), SocketAddr::V4(..)) | (SocketAddr::V6(..), SocketAddr::V6(..)) => {}
+            (SocketAddr::V4(..), SocketAddr::V6(v6_peer_addr)) => {
+                if let Some(v4_ip) = v6_peer_addr.ip().to_ipv4_mapped() {
+                    peer_addr = SocketAddr::new(v4_ip.into(), v6_peer_addr.port());
+                } else {
+                    warn!(
+                        "udp redir send back {} bytes, remote: {}, peer: {}, protocol not match",
+                        data.len(),
+                        addr,
+                        peer_addr
+                    );
+                }
             }
+            (SocketAddr::V6(..), SocketAddr::V4(v4_peer_addr)) => {
+                peer_addr = SocketAddr::new(v4_peer_addr.ip().to_ipv6_mapped().into(), v4_peer_addr.port());
+            }
+        }
 
-            trace!(
-                "udp redir send back data {} bytes, remote: {}, peer: {}, socket_opts: {:?}",
-                n,
-                remote_addr,
-                peer_addr,
-                self.socket_opts
-            );
-        })
+        match inbound.send_to(data, peer_addr).await {
+            Ok(n) => {
+                if n < data.len() {
+                    warn!(
+                        "udp redir send back data (actual: {} bytes, sent: {} bytes), remote: {}, peer: {}",
+                        n,
+                        data.len(),
+                        remote_addr,
+                        peer_addr
+                    );
+                }
+
+                trace!(
+                    "udp redir send back data {} bytes, remote: {}, peer: {}, socket_opts: {:?}",
+                    n,
+                    remote_addr,
+                    peer_addr,
+                    self.socket_opts
+                );
+
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
-pub struct UdpRedir {
+pub struct RedirUdpServer {
     context: Arc<ServiceContext>,
     redir_ty: RedirType,
     time_to_live: Option<Duration>,
     capacity: Option<usize>,
+    listener: UdpRedirSocket,
+    balancer: PingBalancer,
 }
 
-impl UdpRedir {
-    pub fn new(
+impl RedirUdpServer {
+    pub(crate) async fn new(
         context: Arc<ServiceContext>,
         redir_ty: RedirType,
+        client_config: &ServerAddr,
         time_to_live: Option<Duration>,
         capacity: Option<usize>,
-    ) -> UdpRedir {
-        UdpRedir {
-            context,
-            redir_ty,
-            time_to_live,
-            capacity,
-        }
-    }
-
-    pub async fn run(&self, client_config: &ServerAddr, balancer: PingBalancer) -> io::Result<()> {
+        balancer: PingBalancer,
+    ) -> io::Result<RedirUdpServer> {
         let listener = match *client_config {
-            ServerAddr::SocketAddr(ref saddr) => UdpRedirSocket::listen(self.redir_ty, *saddr)?,
+            ServerAddr::SocketAddr(ref saddr) => UdpRedirSocket::listen(redir_ty, *saddr)?,
             ServerAddr::DomainName(ref dname, port) => {
-                lookup_then!(self.context.context_ref(), dname, port, |addr| {
-                    UdpRedirSocket::listen(self.redir_ty, addr)
+                lookup_then!(context.context_ref(), dname, port, |addr| {
+                    UdpRedirSocket::listen(redir_ty, addr)
                 })?
                 .1
             }
         };
 
-        let local_addr = listener.local_addr().expect("determine port bound to");
+        Ok(RedirUdpServer {
+            context,
+            redir_ty,
+            time_to_live,
+            capacity,
+            listener,
+            balancer,
+        })
+    }
+
+    pub async fn run(self) -> io::Result<()> {
+        let local_addr = self.listener.local_addr().expect("determine port bound to");
         info!(
             "shadowsocks UDP redirect ({}) listening on {}",
             self.redir_ty, local_addr
         );
 
         #[allow(clippy::needless_update)]
-        let manager = UdpAssociationManager::new(
+        let (mut manager, cleanup_interval, mut keepalive_rx) = UdpAssociationManager::new(
             self.context.clone(),
             UdpRedirInboundWriter::new(self.redir_ty, self.context.connect_opts_ref()),
             self.time_to_live,
             self.capacity,
-            balancer,
+            self.balancer,
         );
 
         let mut pkt_buf = [0u8; MAXIMUM_UDP_PAYLOAD_SIZE];
+        let mut cleanup_timer = time::interval(cleanup_interval);
+
         loop {
-            let (recv_len, src, mut dst) = match listener.recv_dest_from(&mut pkt_buf).await {
-                Ok(o) => o,
-                Err(err) => {
-                    error!("recv_dest_from failed with err: {}", err);
-                    continue;
+            tokio::select! {
+                _ = cleanup_timer.tick() => {
+                    // cleanup expired associations. iter() will remove expired elements
+                    manager.cleanup_expired().await;
                 }
-            };
 
-            // Packet length is limited by MAXIMUM_UDP_PAYLOAD_SIZE, excess bytes will be discarded.
-            // Copy bytes, because udp_associate runs in another tokio Task
-            let pkt = &pkt_buf[..recv_len];
-
-            trace!(
-                "received UDP packet from {}, destination {}, length {} bytes",
-                src,
-                dst,
-                recv_len
-            );
-
-            if recv_len == 0 {
-                // For windows, it will generate a ICMP Port Unreachable Message
-                // https://docs.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-recvfrom
-                // Which will result in recv_from return 0.
-                //
-                // It cannot be solved here, because `WSAGetLastError` is already set.
-                //
-                // See `relay::udprelay::utils::create_socket` for more detail.
-                continue;
-            }
-
-            // Try to convert IPv4 mapped IPv6 address for dual-stack mode.
-            if let SocketAddr::V6(ref a) = dst {
-                if let Some(v4) = to_ipv4_mapped(a.ip()) {
-                    dst = SocketAddr::new(IpAddr::from(v4), a.port());
+                peer_addr_opt = keepalive_rx.recv() => {
+                    let peer_addr = peer_addr_opt.expect("keep-alive channel closed unexpectly");
+                    manager.keep_alive(&peer_addr).await;
                 }
-            }
 
-            if let Err(err) = manager.send_to(src, Address::from(dst), pkt).await {
-                error!(
-                    "udp packet relay {} -> {} with {} bytes failed, error: {}",
-                    src,
-                    dst,
-                    pkt.len(),
-                    err
-                );
+                recv_result = self.listener.recv_dest_from(&mut pkt_buf) => {
+                    let (recv_len, src, mut dst) = match recv_result {
+                        Ok(o) => o,
+                        Err(err) => {
+                            error!("recv_dest_from failed with err: {}", err);
+                            continue;
+                        }
+                    };
+
+                    // Packet length is limited by MAXIMUM_UDP_PAYLOAD_SIZE, excess bytes will be discarded.
+                    // Copy bytes, because udp_associate runs in another tokio Task
+                    let pkt = &pkt_buf[..recv_len];
+
+                    trace!(
+                        "received UDP packet from {}, destination {}, length {} bytes",
+                        src,
+                        dst,
+                        recv_len
+                    );
+
+                    if recv_len == 0 {
+                        // For windows, it will generate a ICMP Port Unreachable Message
+                        // https://docs.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-recvfrom
+                        // Which will result in recv_from return 0.
+                        //
+                        // It cannot be solved here, because `WSAGetLastError` is already set.
+                        //
+                        // See `relay::udprelay::utils::create_socket` for more detail.
+                        continue;
+                    }
+
+                    // Try to convert IPv4 mapped IPv6 address for dual-stack mode.
+                    if let SocketAddr::V6(ref a) = dst {
+                        if let Some(v4) = to_ipv4_mapped(a.ip()) {
+                            dst = SocketAddr::new(IpAddr::from(v4), a.port());
+                        }
+                    }
+
+                    if let Err(err) = manager.send_to(src, Address::from(dst), pkt).await {
+                        debug!(
+                            "udp packet relay {} -> {} with {} bytes failed, error: {}",
+                            src,
+                            dst,
+                            pkt.len(),
+                            err
+                        );
+                    }
+                }
             }
         }
     }
