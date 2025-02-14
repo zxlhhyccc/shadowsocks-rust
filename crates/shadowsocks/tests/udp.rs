@@ -7,7 +7,8 @@ use tokio::{net::UdpSocket, sync::Barrier};
 use shadowsocks::{
     config::{ServerConfig, ServerType},
     context::{Context, SharedContext},
-    crypto::v1::CipherKind,
+    crypto::CipherKind,
+    net::UdpSocket as ShadowUdpSocket,
     relay::{socks5::Address, udprelay::ProxySocket},
 };
 
@@ -15,7 +16,7 @@ async fn handle_udp_server_client(
     peer_addr: SocketAddr,
     remote_addr: Address,
     payload: &[u8],
-    socket: &ProxySocket,
+    socket: &ProxySocket<ShadowUdpSocket>,
 ) -> io::Result<()> {
     let remote_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
@@ -59,7 +60,7 @@ async fn udp_tunnel_echo(
     password: &str,
     method: CipherKind,
 ) -> io::Result<()> {
-    let svr_cfg_server = ServerConfig::new(server_addr, password, method);
+    let svr_cfg_server = ServerConfig::new(server_addr, password, method).unwrap();
     let svr_cfg_local = svr_cfg_server.clone();
 
     let ctx_server = Context::new_shared(ServerType::Server);
@@ -124,7 +125,7 @@ async fn udp_tunnel_echo(
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(local_addr).await?;
 
-    static SEND_PAYLOAD: &[u8] = b"HELLO WORLD. \012345";
+    const SEND_PAYLOAD: &[u8] = b"HELLO WORLD. \x0012345";
     socket.send(SEND_PAYLOAD).await?;
 
     let mut buffer = [0u8; 65536];
@@ -135,6 +136,7 @@ async fn udp_tunnel_echo(
     Ok(())
 }
 
+#[cfg(feature = "aead-cipher")]
 #[tokio::test]
 async fn udp_tunnel_aead() {
     let _ = env_logger::try_init();
@@ -179,4 +181,44 @@ async fn udp_tunnel_none() {
     udp_tunnel_echo(server_addr, local_addr, target_addr, "pas$$", CipherKind::NONE)
         .await
         .unwrap();
+}
+
+#[cfg(feature = "aead-cipher-2022")]
+#[tokio::test]
+async fn udp_tunnel_aead_2022_aes() {
+    let _ = env_logger::try_init();
+
+    let server_addr = "127.0.0.1:24001".parse::<SocketAddr>().unwrap();
+    let local_addr = "127.0.0.1:24101".parse::<SocketAddr>().unwrap();
+    let target_addr = "127.0.0.1:24201".parse::<SocketAddr>().unwrap();
+
+    udp_tunnel_echo(
+        server_addr,
+        local_addr,
+        target_addr,
+        "D1HJFfvRIxpklHLeKvjCDQ==",
+        CipherKind::AEAD2022_BLAKE3_AES_128_GCM,
+    )
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "aead-cipher-2022")]
+#[tokio::test]
+async fn udp_tunnel_aead_2022_chacha20() {
+    let _ = env_logger::try_init();
+
+    let server_addr = "127.0.0.1:25001".parse::<SocketAddr>().unwrap();
+    let local_addr = "127.0.0.1:25101".parse::<SocketAddr>().unwrap();
+    let target_addr = "127.0.0.1:25201".parse::<SocketAddr>().unwrap();
+
+    udp_tunnel_echo(
+        server_addr,
+        local_addr,
+        target_addr,
+        "4wYfDniq4N6kMqFajRO03PPZLfPkl469eNYY9Wz0E78=",
+        CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305,
+    )
+    .await
+    .unwrap();
 }
