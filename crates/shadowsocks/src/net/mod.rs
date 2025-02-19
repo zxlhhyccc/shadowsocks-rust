@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 pub use self::sys::uds::{UnixListener, UnixStream};
 pub use self::{
-    option::{AcceptOpts, ConnectOpts},
+    option::{AcceptOpts, ConnectOpts, TcpSocketOpts, UdpSocketOpts},
+    sys::{get_ip_stack_capabilities, set_tcp_fastopen, socket_bind_dual_stack, IpStackCapabilities},
     tcp::{TcpListener, TcpStream},
     udp::UdpSocket,
 };
@@ -39,5 +40,15 @@ impl From<SocketAddr> for AddrFamily {
             SocketAddr::V4(..) => AddrFamily::Ipv4,
             SocketAddr::V6(..) => AddrFamily::Ipv6,
         }
+    }
+}
+
+/// Check if `SocketAddr` could be used for creating dual-stack sockets
+pub fn is_dual_stack_addr(addr: &SocketAddr) -> bool {
+    if let SocketAddr::V6(ref v6) = *addr {
+        let ip = v6.ip();
+        ip.is_unspecified() || ip.to_ipv4_mapped().is_some()
+    } else {
+        false
     }
 }

@@ -46,6 +46,7 @@ impl fmt::Display for ManagerSocketAddr {
 /// Datagram socket for manager
 ///
 /// For *nix system, this is a wrapper for both UDP socket and Unix socket
+#[derive(Debug)]
 pub enum ManagerDatagram {
     UdpDatagram(UdpSocket),
     #[cfg(unix)]
@@ -97,7 +98,11 @@ impl ManagerDatagram {
             #[cfg(unix)]
             // For unix socket, it doesn't need to bind to any valid address
             // Because manager won't response to you
-            ManagerAddr::UnixSocketAddr(..) => Ok(ManagerDatagram::UnixDatagram(UnixDatagram::unbound()?)),
+            ManagerAddr::UnixSocketAddr(ref path) => {
+                let dgram = UnixDatagram::unbound()?;
+                dgram.connect(path)?;
+                Ok(ManagerDatagram::UnixDatagram(dgram))
+            }
         }
     }
 

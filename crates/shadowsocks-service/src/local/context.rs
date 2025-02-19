@@ -15,24 +15,33 @@ use shadowsocks::{
 };
 #[cfg(feature = "local-dns")]
 use tokio::sync::Mutex;
+#[cfg(feature = "local-fake-dns")]
+use tokio::sync::RwLock;
 
-use crate::{acl::AccessControl, net::FlowStat};
+use crate::{acl::AccessControl, config::SecurityConfig, net::FlowStat};
+
+#[cfg(feature = "local-fake-dns")]
+use super::fake_dns::manager::FakeDnsManager;
 
 /// Local Service Context
+#[derive(Clone)]
 pub struct ServiceContext {
     context: SharedContext,
     connect_opts: ConnectOpts,
     accept_opts: AcceptOpts,
 
     // Access Control
-    acl: Option<AccessControl>,
+    acl: Option<Arc<AccessControl>>,
 
     // Flow statistic report
     flow_stat: Arc<FlowStat>,
 
     // For DNS relay's ACL domain name reverse lookup -- whether the IP shall be forwarded
     #[cfg(feature = "local-dns")]
-    reverse_lookup_cache: Mutex<LruCache<IpAddr, bool>>,
+    reverse_lookup_cache: Arc<Mutex<LruCache<IpAddr, bool>>>,
+
+    #[cfg(feature = "local-fake-dns")]
+    fake_dns_manager: Arc<RwLock<Vec<Arc<FakeDnsManager>>>>,
 }
 
 impl Default for ServiceContext {
@@ -51,10 +60,12 @@ impl ServiceContext {
             acl: None,
             flow_stat: Arc::new(FlowStat::new()),
             #[cfg(feature = "local-dns")]
-            reverse_lookup_cache: Mutex::new(LruCache::with_expiry_duration_and_capacity(
+            reverse_lookup_cache: Arc::new(Mutex::new(LruCache::with_expiry_duration_and_capacity(
                 Duration::from_secs(3 * 24 * 60 * 60),
                 10240, // XXX: It should be enough for a normal user.
-            )),
+            ))),
+            #[cfg(feature = "local-fake-dns")]
+            fake_dns_manager: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -89,13 +100,13 @@ impl ServiceContext {
     }
 
     /// Set Access Control List
-    pub fn set_acl(&mut self, acl: AccessControl) {
+    pub fn set_acl(&mut self, acl: Arc<AccessControl>) {
         self.acl = Some(acl);
     }
 
     /// Get Access Control List reference
     pub fn acl(&self) -> Option<&AccessControl> {
-        self.acl.as_ref()
+        self.acl.as_deref()
     }
 
     /// Get cloned flow statistic
@@ -166,5 +177,44 @@ impl ServiceContext {
                 }
             }
         }
+    }
+
+    /// Try to connect IPv6 addresses first if hostname could be resolved to both IPv4 and IPv6
+    pub fn set_ipv6_first(&mut self, ipv6_first: bool) {
+        let context = Arc::get_mut(&mut self.context).expect("cannot set ipv6_first on a shared context");
+        context.set_ipv6_first(ipv6_first);
+    }
+
+    /// Set security config
+    pub fn set_security_config(&mut self, security: &SecurityConfig) {
+        let context = Arc::get_mut(&mut self.context).expect("cannot set security on a shared context");
+        context.set_replay_attack_policy(security.replay_attack.policy);
+    }
+
+    /// Set Fake DNS manager
+    #[cfg(feature = "local-fake-dns")]
+    pub async fn add_fake_dns_manager(&self, manager: Arc<FakeDnsManager>) {
+        let mut managers = self.fake_dns_manager.write().await;
+        managers.push(manager);
+    }
+
+    /// Fake DNS maps IP to Domain
+    #[cfg(feature = "local-fake-dns")]
+    pub async fn try_map_fake_address(&self, addr: &Address) -> Option<Address> {
+        let socket_addr = match addr {
+            Address::DomainNameAddress(..) => return None,
+            Address::SocketAddress(socket_addr) => socket_addr,
+        };
+        let ip_addr = socket_addr.ip();
+
+        for mgr in self.fake_dns_manager.read().await.iter() {
+            if let Ok(Some(name)) = mgr.map_ip_domain(ip_addr).await {
+                let new_addr = Address::DomainNameAddress(name.to_string(), socket_addr.port());
+                log::trace!("fakedns mapped {} -> {}", addr, new_addr);
+                return Some(new_addr);
+            }
+        }
+
+        None
     }
 }

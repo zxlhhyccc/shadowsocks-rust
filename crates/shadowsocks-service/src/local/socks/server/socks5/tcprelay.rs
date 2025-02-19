@@ -3,6 +3,7 @@
 use std::{
     io::{self, ErrorKind},
     net::{Ipv4Addr, SocketAddr},
+    str,
     sync::Arc,
 };
 
@@ -10,15 +11,8 @@ use log::{debug, error, trace, warn};
 use shadowsocks::{
     config::Mode,
     relay::socks5::{
-        self,
-        Address,
-        Command,
-        Error as Socks5Error,
-        HandshakeRequest,
-        HandshakeResponse,
-        Reply,
-        TcpRequestHeader,
-        TcpResponseHeader,
+        self, Address, Command, Error as Socks5Error, HandshakeRequest, HandshakeResponse, PasswdAuthRequest,
+        PasswdAuthResponse, Reply, TcpRequestHeader, TcpResponseHeader,
     },
     ServerAddr,
 };
@@ -29,30 +23,149 @@ use crate::{
         context::ServiceContext,
         loadbalancing::PingBalancer,
         net::AutoProxyClientStream,
-        utils::establish_tcp_tunnel,
+        socks::config::Socks5AuthConfig,
+        utils::{establish_tcp_tunnel, establish_tcp_tunnel_bypassed},
     },
     net::utils::ignore_until_end,
 };
 
 pub struct Socks5TcpHandler {
     context: Arc<ServiceContext>,
-    udp_bind_addr: Option<Arc<ServerAddr>>,
+    udp_associate_addr: Arc<ServerAddr>,
     balancer: PingBalancer,
     mode: Mode,
+    auth: Arc<Socks5AuthConfig>,
 }
 
 impl Socks5TcpHandler {
     pub fn new(
         context: Arc<ServiceContext>,
-        udp_bind_addr: Option<Arc<ServerAddr>>,
+        udp_associate_addr: Arc<ServerAddr>,
         balancer: PingBalancer,
         mode: Mode,
+        auth: Arc<Socks5AuthConfig>,
     ) -> Socks5TcpHandler {
         Socks5TcpHandler {
             context,
-            udp_bind_addr,
+            udp_associate_addr,
             balancer,
             mode,
+            auth,
+        }
+    }
+
+    async fn check_auth(&self, stream: &mut TcpStream, handshake_req: &HandshakeRequest) -> io::Result<()> {
+        use std::io::Error;
+
+        let allow_none = !self.auth.auth_required();
+
+        for method in handshake_req.methods.iter() {
+            match *method {
+                socks5::SOCKS5_AUTH_METHOD_PASSWORD => {
+                    let resp = HandshakeResponse::new(socks5::SOCKS5_AUTH_METHOD_PASSWORD);
+                    trace!("reply handshake {:?}", resp);
+                    resp.write_to(stream).await?;
+
+                    return self.check_auth_password(stream).await;
+                }
+                socks5::SOCKS5_AUTH_METHOD_NONE => {
+                    if !allow_none {
+                        trace!("none authentication method is not allowed");
+                    } else {
+                        let resp = HandshakeResponse::new(socks5::SOCKS5_AUTH_METHOD_NONE);
+                        trace!("reply handshake {:?}", resp);
+                        resp.write_to(stream).await?;
+
+                        return Ok(());
+                    }
+                }
+                _ => {
+                    trace!("unsupported authentication method {}", method);
+                }
+            }
+        }
+
+        let resp = HandshakeResponse::new(socks5::SOCKS5_AUTH_METHOD_NOT_ACCEPTABLE);
+        resp.write_to(stream).await?;
+
+        trace!("reply handshake {:?}", resp);
+
+        Err(Error::new(
+            ErrorKind::Other,
+            "currently shadowsocks-rust does not support authentication",
+        ))
+    }
+
+    async fn check_auth_password(&self, stream: &mut TcpStream) -> io::Result<()> {
+        use std::io::Error;
+
+        const PASSWORD_AUTH_STATUS_FAILURE: u8 = 255;
+
+        // Read initiation negociation
+
+        let req = match PasswdAuthRequest::read_from(stream).await {
+            Ok(i) => i,
+            Err(err) => {
+                let rsp = PasswdAuthResponse::new(err.as_reply().as_u8());
+                let _ = rsp.write_to(stream).await;
+
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("Username/Password Authentication Initial request failed: {err}"),
+                ));
+            }
+        };
+
+        let user_name = match str::from_utf8(&req.uname) {
+            Ok(u) => u,
+            Err(..) => {
+                let rsp = PasswdAuthResponse::new(PASSWORD_AUTH_STATUS_FAILURE);
+                let _ = rsp.write_to(stream).await;
+
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Username/Password Authentication Initial request uname contains invalid characters",
+                ));
+            }
+        };
+
+        let password = match str::from_utf8(&req.passwd) {
+            Ok(u) => u,
+            Err(..) => {
+                let rsp = PasswdAuthResponse::new(PASSWORD_AUTH_STATUS_FAILURE);
+                let _ = rsp.write_to(stream).await;
+
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Username/Password Authentication Initial request passwd contains invalid characters",
+                ));
+            }
+        };
+
+        if self.auth.passwd.check_user(user_name, password) {
+            trace!(
+                "socks5 authenticated with Username/Password method, user: {}, password: {}",
+                user_name,
+                password
+            );
+
+            let rsp = PasswdAuthResponse::new(0);
+            rsp.write_to(stream).await?;
+
+            Ok(())
+        } else {
+            let rsp = PasswdAuthResponse::new(PASSWORD_AUTH_STATUS_FAILURE);
+            rsp.write_to(stream).await?;
+
+            error!(
+                "socks5 rejected Username/Password user: {}, password: {}",
+                user_name, password
+            );
+
+            Err(Error::new(
+                ErrorKind::Other,
+                format!("Username/Password Authentication failed, user: {user_name}, password: {password}"),
+            ))
         }
     }
 
@@ -72,23 +185,7 @@ impl Socks5TcpHandler {
         };
 
         trace!("socks5 {:?}", handshake_req);
-
-        if !handshake_req.methods.contains(&socks5::SOCKS5_AUTH_METHOD_NONE) {
-            use std::io::Error;
-
-            let resp = HandshakeResponse::new(socks5::SOCKS5_AUTH_METHOD_NOT_ACCEPTABLE);
-            resp.write_to(&mut stream).await?;
-
-            return Err(Error::new(
-                ErrorKind::Other,
-                "currently shadowsocks-rust does not support authentication",
-            ));
-        } else {
-            // Reply to client
-            let resp = HandshakeResponse::new(socks5::SOCKS5_AUTH_METHOD_NONE);
-            trace!("reply handshake {:?}", resp);
-            resp.write_to(&mut stream).await?;
-        }
+        self.check_auth(&mut stream, &handshake_req).await?;
 
         // 2. Fetch headers
         let header = match TcpRequestHeader::read_from(&mut stream).await {
@@ -142,10 +239,25 @@ impl Socks5TcpHandler {
             return Ok(());
         }
 
-        let server = self.balancer.best_tcp_server();
-        let svr_cfg = server.server_config();
+        let mut server_opt = None;
+        let remote_result = if self.balancer.is_empty() {
+            AutoProxyClientStream::connect_bypassed(self.context.clone(), &target_addr).await
+        } else {
+            let server = self.balancer.best_tcp_server();
 
-        let mut remote = match AutoProxyClientStream::connect(self.context.clone(), &server, &target_addr).await {
+            let r = AutoProxyClientStream::connect_with_opts(
+                self.context,
+                &server,
+                &target_addr,
+                server.connect_opts_ref(),
+            )
+            .await;
+            server_opt = Some(server);
+
+            r
+        };
+
+        let mut remote = match remote_result {
             Ok(remote) => {
                 // Tell the client that we are ready
                 let header =
@@ -171,30 +283,33 @@ impl Socks5TcpHandler {
             }
         };
 
-        establish_tcp_tunnel(svr_cfg, &mut stream, &mut remote, peer_addr, &target_addr).await
+        match server_opt {
+            Some(server) => {
+                let svr_cfg = server.server_config();
+                establish_tcp_tunnel(svr_cfg, &mut stream, &mut remote, peer_addr, &target_addr).await
+            }
+            None => establish_tcp_tunnel_bypassed(&mut stream, &mut remote, peer_addr, &target_addr).await,
+        }
     }
 
     async fn handle_udp_associate(self, mut stream: TcpStream, client_addr: Address) -> io::Result<()> {
-        match self.udp_bind_addr {
-            None => {
-                warn!("socks5 udp is disabled");
+        if !self.mode.enable_udp() {
+            warn!("socks5 udp is disabled");
 
-                let rh = TcpResponseHeader::new(socks5::Reply::CommandNotSupported, client_addr);
-                rh.write_to(&mut stream).await?;
+            let rh = TcpResponseHeader::new(socks5::Reply::CommandNotSupported, client_addr);
+            rh.write_to(&mut stream).await?;
 
-                Ok(())
-            }
-            Some(bind_addr) => {
-                // shadowsocks accepts both TCP and UDP from the same address
-
-                let rh = TcpResponseHeader::new(socks5::Reply::Succeeded, bind_addr.as_ref().into());
-                rh.write_to(&mut stream).await?;
-
-                // Hold connection until EOF.
-                let _ = ignore_until_end(&mut stream).await;
-
-                Ok(())
-            }
+            return Ok(());
         }
+
+        // shadowsocks accepts both TCP and UDP from the same address
+
+        let rh = TcpResponseHeader::new(socks5::Reply::Succeeded, self.udp_associate_addr.as_ref().into());
+        rh.write_to(&mut stream).await?;
+
+        // Hold connection until EOF.
+        let _ = ignore_until_end(&mut stream).await;
+
+        Ok(())
     }
 }

@@ -1,7 +1,8 @@
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::{Deref, DerefMut},
+    os::fd::AsRawFd,
     pin::Pin,
     task::{self, Poll},
 };
@@ -13,9 +14,8 @@ use tokio::{
 };
 
 use crate::net::{
-    sys::{set_common_sockopt_after_connect, set_common_sockopt_for_connect},
-    AddrFamily,
-    ConnectOpts,
+    sys::{set_common_sockopt_after_connect, set_common_sockopt_for_connect, ErrorKind},
+    AcceptOpts, AddrFamily, ConnectOpts,
 };
 
 /// A wrapper of `TcpStream`
@@ -71,20 +71,45 @@ impl AsyncWrite for TcpStream {
     }
 }
 
-/// Create a `UdpSocket` for connecting to `addr`
-#[inline(always)]
+/// Disable IP fragmentation
+#[inline]
+pub fn set_disable_ip_fragmentation<S: AsRawFd>(_af: AddrFamily, _socket: &S) -> io::Result<()> {
+    Ok(())
+}
+
+/// Create a `UdpSocket` with specific address family
+#[inline]
 pub async fn create_outbound_udp_socket(af: AddrFamily, config: &ConnectOpts) -> io::Result<UdpSocket> {
     let bind_addr = match (af, config.bind_local_addr) {
-        (AddrFamily::Ipv4, Some(IpAddr::V4(ip))) => SocketAddr::new(ip.into(), 0),
-        (AddrFamily::Ipv6, Some(IpAddr::V6(ip))) => SocketAddr::new(ip.into(), 0),
+        (AddrFamily::Ipv4, Some(SocketAddr::V4(addr))) => addr.into(),
+        (AddrFamily::Ipv6, Some(SocketAddr::V6(addr))) => addr.into(),
         (AddrFamily::Ipv4, ..) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
         (AddrFamily::Ipv6, ..) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
     };
 
-    UdpSocket::bind(bind_addr).await
+    bind_outbound_udp_socket(&bind_addr, config).await
 }
 
+/// Create a `UdpSocket` binded to `bind_addr`
+pub async fn bind_outbound_udp_socket(bind_addr: &SocketAddr, _config: &ConnectOpts) -> io::Result<UdpSocket> {
+    let af = AddrFamily::from(bind_addr);
+
+    let socket = UdpSocket::bind(bind_addr).await?;
+    let _ = set_disable_ip_fragmentation(af, &socket);
+
+    Ok(socket)
+}
+
+/// Enable TCP Fast Open
 pub fn set_tcp_fastopen<S: AsRawFd>(_: &S) -> io::Result<()> {
     let err = io::Error::new(ErrorKind::Other, "TFO is not supported in this platform");
     Err(err)
+}
+
+/// Create a TCP socket for listening
+pub async fn create_inbound_tcp_socket(bind_addr: &SocketAddr, _accept_opts: &AcceptOpts) -> io::Result<TcpSocket> {
+    match bind_addr {
+        SocketAddr::V4(..) => TcpSocket::new_v4(),
+        SocketAddr::V6(..) => TcpSocket::new_v6(),
+    }
 }

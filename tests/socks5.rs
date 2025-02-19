@@ -11,13 +11,12 @@ use tokio::{
 };
 
 use shadowsocks_service::{
-    config::{Config, ConfigType, LocalConfig, ProtocolType},
+    config::{Config, ConfigType, LocalConfig, LocalInstanceConfig, ProtocolType, ServerInstanceConfig},
     local::socks::client::socks5::Socks5TcpClient,
-    run_local,
-    run_server,
+    run_local, run_server,
     shadowsocks::{
         config::{Mode, ServerAddr, ServerConfig},
-        crypto::v1::CipherKind,
+        crypto::CipherKind,
         relay::socks5::Address,
     },
 };
@@ -41,18 +40,24 @@ impl Socks5TestServer {
             local_addr,
             svr_config: {
                 let mut cfg = Config::new(ConfigType::Server);
-                cfg.server = vec![ServerConfig::new(svr_addr, pwd.to_owned(), method)];
-                cfg.server[0].set_mode(if enable_udp { Mode::TcpAndUdp } else { Mode::TcpOnly });
+                cfg.server = vec![ServerInstanceConfig::with_server_config(
+                    ServerConfig::new(svr_addr, pwd.to_owned(), method).unwrap(),
+                )];
+                cfg.server[0]
+                    .config
+                    .set_mode(if enable_udp { Mode::TcpAndUdp } else { Mode::TcpOnly });
                 cfg
             },
             cli_config: {
                 let mut cfg = Config::new(ConfigType::Local);
-                cfg.local = vec![LocalConfig::new_with_addr(
+                cfg.local = vec![LocalInstanceConfig::with_local_config(LocalConfig::new_with_addr(
                     ServerAddr::from(local_addr),
                     ProtocolType::Socks,
+                ))];
+                cfg.local[0].config.mode = if enable_udp { Mode::TcpAndUdp } else { Mode::TcpOnly };
+                cfg.server = vec![ServerInstanceConfig::with_server_config(
+                    ServerConfig::new(svr_addr, pwd.to_owned(), method).unwrap(),
                 )];
-                cfg.local[0].mode = if enable_udp { Mode::TcpAndUdp } else { Mode::TcpOnly };
-                cfg.server = vec![ServerConfig::new(svr_addr, pwd.to_owned(), method)];
                 cfg
             },
         }
@@ -121,13 +126,13 @@ async fn socks5_relay_aead() {
     svr.run().await;
 
     let mut c = Socks5TcpClient::connect(
-        Address::DomainNameAddress("www.example.com".to_owned(), 80),
+        Address::DomainNameAddress("detectportal.firefox.com".to_owned(), 80),
         svr.client_addr(),
     )
     .await
     .unwrap();
 
-    let req = b"GET / HTTP/1.0\r\nHost: www.example.com\r\nAccept: */*\r\n\r\n";
+    let req = b"GET /success.txt HTTP/1.0\r\nHost: detectportal.firefox.com\r\nAccept: */*\r\n\r\n";
     c.write_all(req).await.unwrap();
     c.flush().await.unwrap();
 
